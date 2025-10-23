@@ -6,16 +6,11 @@ import html
 import paramiko
 import requests
 import urllib3
+from .utils import get_logger
 from urllib.parse import urlparse, urlunparse
-try:  # package context
-    from .ssh_client import SSH  # type: ignore
-except Exception:  # module context (no parent)
-    from ssh_client import SSH  # type: ignore
+from .ssh_client import SSH
 
-try:  # package context
-    from .vars import PRIVATE_TOKEN, VERIFY_SSL, BASE_URL, UBUNTU_HOST, UBUNTU_USER, UBUNTU_PASSWORD  # type: ignore
-except Exception:  # module context (no parent)
-    from vars import PRIVATE_TOKEN, VERIFY_SSL, BASE_URL, UBUNTU_HOST, UBUNTU_USER, UBUNTU_PASSWORD  # type: ignore
+from .vars import PRIVATE_TOKEN, VERIFY_SSL, BASE_URL, UBUNTU_HOST, UBUNTU_USER, UBUNTU_PASSWORD
 
 # Disable SSL warnings if we're using self-signed certificates
 if not VERIFY_SSL:
@@ -25,12 +20,14 @@ _VERSION_RE = re.compile(r"GitLab\s+(\d+\.\d+\.\d+)")
 HTTP_OK = 200
 
 
+log = get_logger()
+
 def _normalize_base_url(url: str) -> str:
     """Ensure the scheme exists; default to https:// if missing."""
     if not url:
         raise ValueError("BASE_URL is empty")
     if not url.startswith(("http://", "https://")):
-        print(f"⚠️  BASE_URL missing scheme, assuming https://: {url}")
+        log.warning(f"BASE_URL missing scheme, assuming https://: {url}")
         url = f"https://{url}"
     parsed = urlparse(url)
     if not parsed.hostname:
@@ -152,7 +149,7 @@ def _try_ssh_fallback() -> str | None:
             try:
                 remote.close()
             except Exception:  # noqa: BLE001
-                print("⚠️  SSH close failed")
+                log.debug("SSH close failed")
 
 
 def detect_version() -> tuple[str, str | None]:
@@ -167,7 +164,7 @@ def detect_version() -> tuple[str, str | None]:
     if ver:
         return ver, effective
 
-    print("🔄 HTTP endpoints failed, trying SSH fallback...")
+    log.info("HTTP endpoints failed, trying SSH fallback...")
 
     # SSH fallback (requires running container)
     version = _try_ssh_fallback()

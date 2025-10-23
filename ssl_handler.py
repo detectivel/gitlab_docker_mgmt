@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict, Tuple, Optional
+from typing import Dict, Optional
 from contextlib import suppress
 from typing import Tuple
 from .ssh_client import SSH
+from .vars import UBUNTU_USER
+from .utils import get_logger
 
 
 class SSLHandler:
+    log = get_logger()
     """
     Keeps TLS assets for GitLab either in a bind-mounted host folder
     (/home/ubuntu/gitlab/config/ssl) or in a named volume (gitlab_ssl).
@@ -19,7 +22,7 @@ class SSLHandler:
 
     def __init__(self, ssh_client: SSH):
         self.ssh = ssh_client
-        self.cert_path = "/home/ubuntu/gitlab/config/ssl"
+        self.cert_path = f"/home/{UBUNTU_USER}/gitlab/config/ssl"
         self._cert_file: Optional[str] = None
         self._key_file: Optional[str] = None
         self.using_named_volume: bool = False
@@ -66,7 +69,7 @@ class SSLHandler:
         if rc == 0:
             return stdout.strip()
         if self._needs_passwordless_sudo(stderr):
-            print("ℹ️  Passwordless sudo unavailable; retrying without sudo")
+            self.log.info("Passwordless sudo unavailable; retrying without sudo")
             return self.ssh.run(cmd, check=check)
         if check:
             preview = self.ssh._preview(stderr) if hasattr(self.ssh, "_preview") else stderr

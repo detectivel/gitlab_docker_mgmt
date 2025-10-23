@@ -4,6 +4,7 @@ from errno import ENOENT
 import base64
 import posixpath
 import paramiko
+from .utils import get_logger
 
 
 class SSH:
@@ -13,7 +14,12 @@ class SSH:
         self,
         host: str,
         user: str,
-        pw: str,
+        pw: str | None = None,
+        *,
+        key_filename: str | None = None,
+        pkey: paramiko.PKey | None = None,
+        allow_agent: bool = True,
+        look_for_keys: bool = True,
         port: int = 22,
         timeout: int = 30,
         cmd_timeout: int | None = None,
@@ -24,44 +30,76 @@ class SSH:
         """
         self.cli = paramiko.SSHClient()
         self.cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self.cli.connect(
+        self.user = user
+        self.cmd_timeout = cmd_timeout
+        self.log = get_logger()
+
+        # If password or explicit key provided, don't trawl local agent/known keys,
+        # because Paramiko may crash on broken agent keys (public_blob AttributeError).
+        auto_keys = look_for_keys
+        auto_agent = allow_agent
+        if pw or key_filename or pkey:
+            auto_keys = False
+            auto_agent = False
+
+        connect_kwargs = dict(
             hostname=host,
             port=port,
             username=user,
-            password=pw,
-            look_for_keys=False,
-            allow_agent=False,
             timeout=timeout,
+            look_for_keys=auto_keys,
+            allow_agent=auto_agent,
         )
-        self._cmd_timeout = cmd_timeout
+        if key_filename:
+            connect_kwargs["key_filename"] = key_filename
+        if pkey is not None:
+            connect_kwargs["pkey"] = pkey
+        if pw:
+            connect_kwargs["password"] = pw
+
+        # First attempt (may fail if agent keys are problematic in Paramiko 4.x on Windows)
+        try:
+            self.cli.connect(**connect_kwargs)
+        except (paramiko.SSHException, AttributeError) as e:
+            # Fallback: hard-disable agent & key lookup and try again
+            # This specifically works around "AttributeError: public_blob" from agent keys.
+            if "public_blob" in str(e) or isinstance(e, AttributeError):
+                self.log.info("SSH: retrying without agent/auto-keys due to broken agent key (public_blob).")
+                connect_kwargs["allow_agent"] = False
+                connect_kwargs["look_for_keys"] = False
+                self.cli.connect(**connect_kwargs)
+            else:
+                raise
 
     # ------------------------------- exec -------------------------------- #
 
-    def run(self, cmd: str, check: bool = True) -> str:
+    def run(self, cmd: str, check: bool = True, trace: bool = True) -> str:
         """Run *cmd* on the remote host. Return stdout (stripped)."""
-        stdout, stderr, rc = self.run_full(cmd)
+        stdout, stderr, rc = self.run_full(cmd, trace=trace)
         if check and rc:
             # show compact error context
             err_preview = self._preview(stderr)
             raise RuntimeError(f"[{cmd}] failed (rc={rc}):\n{err_preview}")
         return stdout.strip()
 
-    def run_with_status(self, cmd: str) -> tuple[str, int]:
-        """Run *cmd* and return (stdout, exit_status)."""
-        stdout, _stderr, rc = self.run_full(cmd)
+    def run_with_status(self, cmd: str, trace: bool = True) -> tuple[str, int]:
+        """Run *cmd* and return (stdout, exit_status). Never raises."""
+        stdout, _stderr, rc = self.run_full(cmd, trace=trace)
         return stdout.strip(), rc
 
-    def run_full(self, cmd: str) -> tuple[str, str, int]:
+    def run_full(self, cmd: str, trace: bool = True) -> tuple[str, str, int]:
         """Run *cmd* and return (stdout, stderr, exit_status) without raising."""
-        stdin, out, err = self.cli.exec_command(cmd)
+        # Note: Paramiko's exec_command(timeout=...) sets the Channel timeout for I/O operations.
+        stdin, out, err = self.cli.exec_command(cmd, timeout=self.cmd_timeout)
         stdout = out.read().decode(errors="replace")
         stderr = err.read().decode(errors="replace")
         rc = out.channel.recv_exit_status()
         # Lightweight console trace (trimmed)
-        if rc == 0:
-            print(f"✅ {cmd} -> rc=0, out='{self._preview(stdout)}'")
-        else:
-            print(f"❌ {cmd} -> rc={rc}, err='{self._preview(stderr)}'")
+        if trace:
+            if rc == 0:
+                self.log.debug(f"{cmd} -> rc=0, out='{self._preview(stdout)}'")
+            else:
+                self.log.debug(f"{cmd} -> rc={rc}, err='{self._preview(stderr)}'")
         return stdout, stderr, rc
 
     # ------------------------------ transfer ----------------------------- #
@@ -82,12 +120,12 @@ class SSH:
                 if remote_dir and remote_dir != "/":
                     self._mkdir_p_sftp(sftp, remote_dir)
                 sftp.put(local_path, remote_path)
-                print(f"✅ Uploaded {local_path} to {remote_path} via SFTP")
+                self.log.info(f"Uploaded {local_path} to {remote_path} via SFTP")
                 return
             finally:
                 sftp.close()
         except Exception as e:
-            print(f"⚠️  SFTP upload failed: {e}. Falling back to base64 streaming…")
+            self.log.warning(f"SFTP upload failed: {e}. Falling back to base64 streaming…")
 
         # 2) Fallback: base64 (robust for text/binary)
         try:
@@ -108,7 +146,7 @@ __B64__
 mv -f '{tmp_remote}' '{remote_path}'
 """
             self.run(script)
-            print(f"✅ Uploaded {local_path} to {remote_path} via base64 stream")
+            self.log.info(f"Uploaded {local_path} to {remote_path} via base64 stream")
         except Exception as e:
             raise RuntimeError(
                 f"All upload methods failed for {local_path} -> {remote_path}: {e}"
@@ -144,7 +182,7 @@ mv -f '{tmp_remote}' '{remote_path}'
 
     def stream(self, cmd: str):
         """Yield lines of *cmd* stdout as they arrive (no buffering)."""
-        _stdin, out, _err = self.cli.exec_command(cmd)
+        _stdin, out, _err = self.cli.exec_command(cmd, timeout=self.cmd_timeout)
         try:
             for line in iter(out.readline, ""):
                 yield line.rstrip("\n")

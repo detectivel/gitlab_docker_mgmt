@@ -22,10 +22,7 @@ from typing import Any, Iterable
 
 import requests
 
-try:  # package import (when run as gitlab_docker_upgrader.gitlab_projects)
-    from .gitlab_version import detect_version  # type: ignore
-except Exception:  # standalone import (pytest running from tests/, no package parent)
-    from gitlab_version import detect_version  # type: ignore
+from .gitlab_version import detect_version  # must return like "15.11.2"
 
 _URL = "https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/path.json"
 _OUT_FILE = "upgrade_path.txt"
@@ -170,13 +167,6 @@ def _latest_patch(by_mm: dict[int, dict[int, list[str]]], maj: int, minr: int) -
     return arr[-1] if arr else None
 
 def _inflate_to_latest_patch(steps: list[str], metadata: dict[str, Any]) -> list[str]:
-    if all(isinstance(s, str) and len(s.split(".")) == 3 for s in steps):
-        return steps
-
-    versions = metadata.get("all")
-    if not isinstance(versions, Iterable):
-        return steps
-
     all_versions = _all_versions_from_metadata(metadata)
     by_mm = _group_by_major_minor(all_versions)
     inflated: list[str] = []
@@ -187,6 +177,7 @@ def _inflate_to_latest_patch(steps: list[str], metadata: dict[str, Any]) -> list
             latest = _latest_patch(by_mm, maj, minr)
             if latest:
                 inflated.append(latest)
+            # если нет, пропускаем точку опоры без патча
         else:
             inflated.append(s)
     return inflated

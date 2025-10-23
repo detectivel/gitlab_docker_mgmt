@@ -43,8 +43,8 @@ The same workflow also handles first-time installs by detecting that no volumes 
 
 ```bash
 # Clone the repository
-git clone https://gitlab.example.com/infra/gitlab-docker-upgrader.git
-cd gitlab-docker-upgrader
+git clone https://gitlab.example.com/infra/<gitlab_project_name>.git
+cd <gitlab_project_name>
 
 # Create a virtual environment (recommended)
 python -m venv .venv
@@ -53,8 +53,8 @@ source .venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 ```
-
-> The package can also be invoked with `python -m gitlab_docker_upgrader` thanks to the `__main__.py` entry point.
+<b>NOTE!</b> You must be one folder before the project, so the python -m will work, or run it from entry point `__main.py__` .
+> The package can also be invoked with `python -m <path_to_gitlab_project>` thanks to the `__main__.py` entry point.
 
 ---
 
@@ -62,7 +62,7 @@ pip install -r requirements.txt
 
 The upgrader reads configuration from environment variables. A `.env` file is automatically loaded from:
 
-1. `gitlab_docker_upgrader/.env`
+1. `<path_to_gitlab_project>/.env`
 2. The repository root `.env`
 3. The current working directory
 
@@ -97,6 +97,9 @@ GITLAB_SSL_BIND=true
 LOG_LEVEL=INFO
 LOG_PATH=/home/${GITLAB_NODE_USER}/gitlab-upgrader.log
 LOG_JSON=false
+
+# ─── Monitoring subnets ─────────────────────────────────────────────────────
+ALLOWED_SUBNET=192.168.0.0/16 # or similar to it
 ```
 
 Additional toggles include:
@@ -116,16 +119,21 @@ All variables are defined in [`vars.py`](vars.py) if you need the authoritative 
 Run the CLI from the repository root (with your virtual environment activated):
 
 ```bash
-python -m gitlab_docker_upgrader <command>
+python -m <path_to_gitlab_project> <command>
 ```
 
 Available commands:
 
-| Command | When to use it |
-| --- | --- |
-| `dry_run` | Prints the detected state, planned upgrade path, and Compose changes without modifying the remote host. |
-| `install` | Provision a fresh GitLab instance. Installs Docker if necessary, scaffolds Compose, and deploys the target version. |
-| `upgrade` | Perform an in-place upgrade. The upgrader will compute the intermediate versions and apply them sequentially.
+| Command          | When to use it |
+|------------------| --- |
+| `dry_run`        | Prints the detected state, planned upgrade path, and Compose changes without modifying the remote host. |
+| `install`        | Provision a fresh GitLab instance. Installs Docker if necessary, scaffolds Compose, and deploys the target version. |
+| `upgrade`        | Perform an in-place upgrade. The upgrader will compute the intermediate versions and apply them sequentially.
+| `status`         | Check current status of Gitlab instanse.
+| `revise_version` | Changes the latest tag in compose file to current installed version.
+| `start`          | Starts the Gitlab instance.
+| `cert_renew`     | Renews Gitlab's selfsigned certificates.
+| `images_cleanup` | Cleans up unused gitlab images (from upgrade).
 
 During execution you will see live progress logs for SSH commands, Docker pulls, and health checks. Each upgrade hop waits for GitLab to pass the readiness probes before continuing.
 
@@ -134,7 +142,7 @@ During execution you will see live progress logs for SSH commands, Docker pulls,
 If you only need the intermediate versions (for documentation or a change request), generate `upgrade_path.txt` without performing an upgrade:
 
 ```bash
-python -m gitlab_docker_upgrader.upgrade_path
+python -m <path_to_giltab_project>.upgrade_path
 ```
 
 The file is written to the current working directory and mirrors GitLab's official upgrade path for your detected source version.
@@ -143,7 +151,7 @@ The file is written to the current working directory and mirrors GitLab's offici
 
 ## 🛠 Remote sudo configuration
 
-The upgrader issues read-only commands such as `ls`, `cat`, `find`, and `test` via `sudo` to inspect Docker volumes. Configure passwordless sudo for these binaries on the remote host (we will use user: ubuntu):
+The upgrader issues read-only commands such as `ls`, `cat`, `find`, and `test` via `sudo` to inspect Docker volumes. Configure passwordless sudo for these binaries on the remote host:
 
 ```bash
 sudo visudo -f /etc/sudoers.d/gitlab-upgrader
@@ -196,7 +204,3 @@ sudo -n /usr/bin/ls -la /var/lib/docker/volumes
 Pull requests should include updates to documentation when user-facing behavior changes.
 
 ---
-
-## 📄 License
-
-This project is released under the [MIT License](LICENSE).

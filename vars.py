@@ -42,9 +42,9 @@ PRIVATE_TOKEN   = os.getenv("GITLAB_PRIVATE_TOKEN", "")      # optional token
 VERIFY_SSL      = _env_bool("GITLAB_VERIFY_SSL", False)
 
 # ---------- Image / runtime defaults ----------
-GITLAB_IMAGE           = os.getenv("GITLAB_IMAGE", "gitlab/gitlab-ce:15.11.2-ce.0")
+GITLAB_IMAGE           = os.getenv("GITLAB_IMAGE")
 GITLAB_CONTAINER_NAME  = os.getenv("GITLAB_CONTAINER_NAME", "gitlab")
-GITLAB_HOSTNAME        = os.getenv("GITLAB_HOSTNAME", "support.lab.local")
+GITLAB_HOSTNAME        = os.getenv("GITLAB_HOSTNAME")
 GITLAB_HOSTNAME_FROM_ENV = "GITLAB_HOSTNAME" in os.environ
 GITLAB_HTTP_PORT       = _env_int("GITLAB_HTTP_PORT", 8080)
 GITLAB_HTTPS_PORT      = _env_int("GITLAB_HTTPS_PORT", 9443)
@@ -59,6 +59,8 @@ GITLAB_SSL_BIND        = _env_bool("GITLAB_SSL_BIND", True)
 UBUNTU_HOST     = os.getenv("GITLAB_NODE_IP", "")
 UBUNTU_USER     = os.getenv("GITLAB_NODE_USER", "ubuntu")
 UBUNTU_PASSWORD = os.getenv("GITLAB_NODE_PASSWORD", "")
+GITLAB_NODE_KEY_FILE = os.getenv("GITLAB_NODE_KEY_FILE", "")
+GITLAB_NODE_KEY_PASSPHRASE = os.getenv("GITLAB_NODE_KEY_PASSPHRASE", "")
 
 # Compose working directory on the remote host
 # If GITLAB_COMPOSE_DIR not provided, default to /home/ubuntu
@@ -68,6 +70,7 @@ GITLAB_SSL_HOST_DIR = os.getenv(
     "GITLAB_SSL_HOST_DIR",
     f"{COMPOSE_DIR.rstrip('/')}/gitlab/config/ssl"
 )
+ALLOWED_SUBNET = os.getenv("ALLOWED_SUBNET", "192.168.0.0/16")
 
 # ---------- Logging (optional; consumed by utils.get_logger if you add it) ----------
 LOG_LEVEL       = os.getenv("LOG_LEVEL", "INFO")             # DEBUG/INFO/WARN/ERROR
@@ -97,6 +100,7 @@ if __name__ == "__main__":
     print(f"LOG_LEVEL: '{LOG_LEVEL}'")
     print(f"LOG_PATH: '{LOG_PATH}'")
     print(f"LOG_JSON: {LOG_JSON}")
+    print(f"ALLOWED_SUBNET: {ALLOWED_SUBNET}")
 
     if BASE_URL and not BASE_URL.startswith(('http://', 'https://')):
         print(f"❌ BASE_URL missing protocol scheme: {BASE_URL}")

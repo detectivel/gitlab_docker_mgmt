@@ -8,6 +8,7 @@ import re
 import sys
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from typing import Optional
 
 # --------------------------------------------------------------------
 # keep existing API used by docker_compose.py
@@ -41,52 +42,103 @@ class _JsonFormatter(logging.Formatter):
             payload["exc_info"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False)
 
+def _remote_is_dir(remote, path: str) -> bool:
+    """Return True if path exists and is a directory on the remote host."""
+    if not path:
+        return False
+    out = remote.run(f"[ -d '{path}' ] && echo OK || true", check=False).strip()
+    if out == "OK":
+        return True
+    out = remote.run(f"sudo [ -d '{path}' ] && echo OK || true", check=False).strip()
+    return out == "OK"
+
 def docker_root_dir(remote) -> str:
     """
-    Возвращает актуальный Docker Root Dir (где лежит всё, включая volumes).
-    Основа — `docker info --format {{.DockerRootDir}}`. Есть fallback’и.
+    Discover Docker root directory on the remote host without hardcoding usernames.
 
-    Примеры путей:
-      - /var/lib/docker
-      - /var/snap/docker/common/var-lib-docker      (snap)
-      - /home/ubuntu/.local/share/docker            (rootless/user)
+    Priority:
+      1) Explicit override: DOCKER_ROOT_DIR (env on the remote)
+      2) docker info --format '{{.DockerRootDir}}' (then sudo docker info)
+      3) Well-known system locations (/var/lib/docker, snap)
+      4) Rootless candidate derived from env-driven compose dir (GITLAB_COMPOSE_DIR)
+         e.g. /home/${GITLAB_NODE_USER}/.local/share/docker
+
+    Returns an absolute path. Falls back to '/var/lib/docker' if nothing matches.
     """
-    candidates: list[str] = []
+    # 1) Remote env override
+    try:
+        override = remote.run("printf %s \"${DOCKER_ROOT_DIR:-}\"", check=False).strip()
+        if override and _remote_is_dir(remote, override):
+            return override
+    except Exception:
+        pass
 
-    # 1) Прямой запрос у Docker (без sudo)
-    out = remote.run("docker info --format '{{.DockerRootDir}}'", check=False).strip()
-    if out:
-        candidates.append(out)
+    # 2) Ask Docker directly
+    for cmd in (
+        "docker info --format '{{json .DockerRootDir}}'",
+        "sudo docker info --format '{{json .DockerRootDir}}'",
+    ):
+        try:
+            raw = remote.run(cmd, check=False).strip()
+            if raw and raw != "null":
+                try:
+                    # docker prints JSON string if using {{json ...}}
+                    import json as _json
+                    path = _json.loads(raw)
+                except Exception:
+                    path = raw.strip().strip('"')
+                if isinstance(path, str) and _remote_is_dir(remote, path):
+                    return path
+        except Exception:
+            pass
 
-    # 2) Пробуем через sudo — на случай, если docker доступен только root’у
-    if not out:
-        out_sudo = remote.run("sudo docker info --format '{{.DockerRootDir}}'", check=False).strip()
-        if out_sudo:
-            candidates.append(out_sudo)
-
-    # 3) Типичные дефолты как запасной вариант
-    candidates += [
-        "/var/lib/docker",                                   # пакетная установка
-        "/var/snap/docker/common/var-lib-docker",            # snap (Ubuntu)
-        f"/home/{getattr(remote, 'user', 'ubuntu')}/.local/share/docker",  # rootless
+    # 3) System-wide common locations
+    candidates: list[str] = [
+        "/var/lib/docker",
+        "/var/snap/docker/common/var-lib-docker",
     ]
 
-    # Возвращаем первый реально существующий каталог
+    # 4) Rootless candidate derived from env (no hardcoded usernames)
+    # Prefer GITLAB_COMPOSE_DIR if provided (from your .env),
+    # else derive from GITLAB_NODE_USER if available.
+    try:
+        # Pull values from process env first
+        compose_dir = os.getenv("GITLAB_COMPOSE_DIR", "")
+        node_user = os.getenv("GITLAB_NODE_USER", "")
+
+        # Try importing your vars.py for CI-injected values (optional)
+        try:
+            from . import vars as _vars  # type: ignore
+            compose_dir = getattr(_vars, "GITLAB_COMPOSE_DIR", compose_dir) or compose_dir
+            node_user = getattr(_vars, "GITLAB_NODE_USER", node_user) or node_user
+        except Exception:
+            pass
+
+        if compose_dir:
+            # normalize like /home/<user>  -> /home/<user>/.local/share/docker
+            # or any other path -> <compose_dir>/.local/share/docker
+            rootless = posixpath.join(compose_dir.rstrip("/"), ".local/share/docker")
+            candidates.append(rootless)
+        elif node_user:
+            candidates.append(f"/home/{node_user}/.local/share/docker")
+        else:
+            # As a very last resort (no env at all), try expanding remote ~:
+            home = remote.run("eval echo ~", check=False).strip()
+            if home:
+                candidates.append(f"{home.rstrip('/')}/.local/share/docker")
+    except Exception:
+        pass
+
     for p in candidates:
-        if not p:
-            continue
-        # проверяем существование директории (с sudo и без)
-        if remote.run(f"test -d '{p}' && echo ok || true", check=False).strip() == "ok":
-            return p
-        if remote.run(f"sudo test -d '{p}' && echo ok || true", check=False).strip() == "ok":
+        if _remote_is_dir(remote, p):
             return p
 
-    # В самом крайнем случае — классика
+    # ultimate fallback
     return "/var/lib/docker"
 
 
 def docker_volumes_dir(remote) -> str:
-    """Удобная обёртка: вернёт <root>/volumes с нормализацией слэшей."""
+    """Return the remote Docker volumes directory derived from docker_root_dir()."""
     root = docker_root_dir(remote).rstrip("/")
     return posixpath.join(root, "volumes")
 
@@ -155,38 +207,68 @@ def get_logger(name: str = "gitlab_upgrader") -> logging.Logger:
     return logger
 
 
-# -------- pretty console helpers (also write to logger if created) --------
+
+def _strip_emoji(text: str) -> str:
+    """Optionally strip non-ASCII chars (emojis) when LOG_STRIP_EMOJI=1."""
+    if os.getenv("LOG_STRIP_EMOJI", "0").lower() not in {"1", "true", "yes", "y"}:
+        return text
+    try:
+        return text.encode("ascii", errors="ignore").decode("ascii", errors="ignore")
+    except Exception:
+        return text
+
+def route_prints_to_logger(level: str | int | None = None) -> None:
+    """Redirect builtins.print to the project logger so legacy prints obey LOG_LEVEL.
+
+    Level precedence:
+      - explicit *level* argument, if given
+      - env LOG_REDIRECT_LEVEL (e.g., INFO, WARNING)
+      - fallback to logger.level
+    Toggle with LOG_REDIRECT_PRINT=1 (or call explicitly from code).
+    """
+    import builtins
+    logger = get_logger()
+    if isinstance(level, str):
+        lvl = getattr(logging, level.upper(), logger.level)
+    elif isinstance(level, int):
+        lvl = level
+    else:
+        env_level = os.getenv("LOG_REDIRECT_LEVEL", "")
+        lvl = getattr(logging, env_level.upper(), logger.level)
+
+    def _print_to_log(*args, **kwargs):
+        sep = kwargs.get("sep", " ")
+        end = kwargs.get("end", "\n")
+        msg = sep.join(str(a) for a in args) + ("" if end == "" else "")
+        msg = _strip_emoji(msg)
+        logger.log(lvl, msg)
+
+    builtins.print = _print_to_log
+
+# -------- pretty console helpers (log-only; no unconditional prints) --------
 
 def _emit(kind: str, msg: str):
+    """Send message at appropriate level to the configured logger only.
+    Former versions printed to console unconditionally which ignored LOG_LEVEL.
+    Now console output honors LOG_LEVEL via handler level.
     """
-    Print pretty to console and also log to get_logger() if already initialized.
-    """
-    prefix = {
-        "step": "▶",
-        "ok": "✔",
-        "warn": "⚠️",
-        "fail": "❌",
-        "info": "ℹ️",
-        "debug": "🛠️",
-    }.get(kind, "•")
+    if _LOGGER is None:
+        logger = get_logger()
+    else:
+        logger = _LOGGER
 
-    line = f"{prefix} {msg}"
-    print(line)
+    if kind == "ok":
+        logger.info(msg)
+    elif kind == "warn":
+        logger.warning(msg)
+    elif kind == "fail":
+        logger.error(msg)
+    elif kind == "debug":
+        logger.debug(msg)
+    else:
+        logger.info(msg)
 
-    if _LOGGER is not None:
-        if kind == "ok":
-            _LOGGER.info(msg)
-        elif kind == "warn":
-            _LOGGER.warning(msg)
-        elif kind == "fail":
-            _LOGGER.error(msg)
-        elif kind == "debug":
-            _LOGGER.debug(msg)
-        else:
-            _LOGGER.info(msg)
-
-
-def log_step(msg: str):  _emit("step", msg)
+def log_step(msg: str):  _emit("info", msg)
 def log_ok(msg: str):    _emit("ok", msg)
 def log_warn(msg: str):  _emit("warn", msg)
 def log_fail(msg: str):  _emit("fail", msg)
@@ -195,6 +277,7 @@ def log_debug(msg: str): _emit("debug", msg)
 
 
 # -------- small utility: redact strings in logs --------
+
 
 def redact(text: str, secrets: list[str] | None = None) -> str:
     """

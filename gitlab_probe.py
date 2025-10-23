@@ -1,8 +1,11 @@
-from __future__ import annotations
+# gitlab_probe.py
 
+from __future__ import annotations
 import time
+import shlex
 import re
 import html
+import json
 import paramiko
 import requests
 import urllib3
@@ -27,11 +30,75 @@ class GitLabProbe:
 
     # -------------------------- docker helpers -------------------------- #
 
+
+    def read_pg_data_version(self, name: str = "gitlab") -> str | None:
+        """Return on-disk cluster PG_VERSION (e.g., '14', '15', '16') or None."""
+        out = self.r.run(
+            f"docker exec {name} bash -lc \"cat /var/opt/gitlab/postgresql/data/PG_VERSION 2>/dev/null || true\"",
+            check=False,
+            trace=False,
+        )
+        v = (out or "").strip()
+        return v or None
+
+    def ensure_pg16(self, name: str = "gitlab") -> bool:
+        """
+        Ensure the on-disk Postgres cluster is v16+. If lower, run a one-time pg-upgrade.
+        Returns True if cluster is 16+ (already or after upgrade).
+        """
+        v = self.read_pg_data_version(name)
+        if not v:
+            return False  # can't detect -> let normal flow continue
+        try:
+            major = int(v.split(".", 1)[0])
+        except ValueError:
+            return False
+        if major >= 16:
+            return True
+
+        # avoid repeat: set a flag file
+        flag = "/var/opt/gitlab/.pg_upgrade_attempted"
+        out, rc = self.r.run_with_status(
+            f"docker exec {name} bash -lc \"test -f '{flag}'\"",
+            trace=False,
+        )
+        if rc != 0:
+            # permissive fixes and upgrade
+            self.r.run(
+                f"docker exec {name} update-permissions",
+                check=False,
+                trace=False,
+            )
+            self.r.run(
+                f"docker exec {name} bash -lc "
+                "\"chown -R gitlab-psql:gitlab-psql /var/opt/gitlab/postgresql && chmod 700 /var/opt/gitlab/postgresql\"",
+                check=False,
+                trace=False,
+            )
+            # run pg-upgrade (omnibus helper)
+            self.r.run(
+                f"docker exec -t {name} gitlab-ctl pg-upgrade",
+                check=False,
+                trace=False,
+            )
+            self.r.run(
+                f"docker exec {name} bash -lc \"touch '{flag}'\"",
+                check=False,
+                trace=False,
+            )
+            # re-check
+            v2 = self.read_pg_data_version(name)
+            try:
+                return v2 is not None and int(v2.split(".", 1)[0]) >= 16
+            except Exception:
+                return False
+        return True
+
     def _find_gitlab_container(self) -> str:
-        """Find any running GitLab container name"""
+        """Find any running GitLab container name (fallback 'gitlab')."""
         try:
             result = self.r.run(
-                "docker ps --format '{{.Names}}\t{{.Image}}' | grep gitlab",
+                "docker ps --format '{{.Names}}\\t{{.Image}}' | grep gitlab",
                 check=False,
             )
             if result:
@@ -51,11 +118,138 @@ class GitLabProbe:
             insp = self.r.run(
                 f"docker inspect {container_name} --format '{{{{json .State.Health.Status}}}}'",
                 check=False,
+                trace=False,
             )
-            return insp.strip('"') if insp else "unknown"
+            raw = (insp or "").strip()
+            try:
+                # might be plain "healthy" or quoted JSON string
+                return json.loads(raw)
+            except Exception:
+                return raw.strip('"') or "unknown"
         except (RuntimeError, OSError, paramiko.SSHException) as err:
             self.log.debug("docker health check failed: %s", err)
             return "unknown"
+
+    # -------------------------- PG quick helpers -------------------------- #
+
+    def pg_status_ok(self, name: str = "gitlab") -> bool:
+        """Return True if postgresql service is 'run:' in gitlab-ctl status."""
+        out = self.r.run(
+            f"docker exec -t {name} bash -lc \"gitlab-ctl status postgresql || true\"",
+            check=False,
+        ) or ""
+        return "run:" in out
+
+    def print_pg_tail(self, name: str = "gitlab", n: int = 120) -> None:
+        """Print last N lines of PG logs (best effort)."""
+        out = self.r.run(
+            f"docker exec -t {name} bash -lc 'gitlab-ctl tail postgresql -n {n} 2>/dev/null || true'",
+            check=False,
+        )
+        print(out or "(no postgresql logs)")
+
+    def wait_postgres_ready(self, name: str = "gitlab", timeout_s: int = 120) -> None:
+        """Wait until postgresql is reported as 'run:'; raise with tail if not."""
+        import time
+
+        start = time.time()
+        while time.time() - start < timeout_s:
+            if self.pg_status_ok(name):
+                return
+            time.sleep(3)
+
+        # diagnostics before raising
+        print("🔎 PostgreSQL didn't become ready in time. Tail:")
+        self.print_pg_tail(name, n=200)
+        raise RuntimeError("PostgreSQL did not become ready in time")
+
+    def _rake(self, name: str, cmd: str) -> str:
+        return self.r.run(f"docker exec -t {name} bash -lc {shlex.quote(cmd)}", check=False) or ""
+
+    def background_migrations_pending(self, name: str = "gitlab") -> bool:
+        out = self.r.run(
+            f"docker exec -t {name} bash -lc "
+            "'gitlab-rake gitlab:background_migrations:status || true'",
+            check=False,
+        ) or ""
+        return bool(re.search(r'^(queued|active|retrying|paused)\b', out, re.MULTILINE))
+
+    def wait_migrations_done(
+            self,
+            name: str = "gitlab",
+            timeout_s: int = 7200,
+            poll: int = 10,
+            bgm_heartbeat_s: int = 60,
+    ) -> None:
+        start = time.time()
+        deadline = start + timeout_s
+
+        def _counts() -> tuple[int, int, int, int]:
+            out = self.r.run(
+                f"docker exec -t {name} bash -lc "
+                "'gitlab-rake gitlab:background_migrations:status || true'",
+                check=False,
+            ) or ""
+            q = len(re.findall(r'^queued\b', out, re.MULTILINE))
+            a = len(re.findall(r'^active\b', out, re.MULTILINE))
+            r = len(re.findall(r'^retrying\b', out, re.MULTILINE))
+            p = len(re.findall(r'^paused\b', out, re.MULTILINE))
+            return q, a, r, p
+
+        try:
+            self.r.run(
+                f"docker exec -t {name} bash -lc "
+                "'for i in $(seq 1 30); do /opt/gitlab/embedded/bin/pg_isready -q -d postgres && exit 0; sleep 2; done; exit 1'",
+                check=False,
+            )
+        except Exception:
+            pass
+
+        # 1) schema migrations
+        printed_wait = False
+        while time.time() < deadline:
+            if self.db_migrations_up(name):
+                if printed_wait:
+                    print("schema: OK")
+                break
+            if not printed_wait:
+                print("schema: waiting for Rails migrations …")
+                printed_wait = True
+            time.sleep(poll)
+        else:
+            raise RuntimeError("timeout: Rails migrations didn’t finish")
+
+        print("bgm: waiting for background migrations to complete …")
+        last_counts: tuple[int, int, int, int] | None = None
+        last_print_ts = 0.0
+
+        while time.time() < deadline:
+            q, a, r, p = _counts()
+            now = time.time()
+            changed = (last_counts is None) or (last_counts != (q, a, r, p))
+            heartbeat = (now - last_print_ts) >= bgm_heartbeat_s
+
+            if changed or heartbeat:
+                elapsed = int(now - start)
+                print(f"bgm: queued={q} active={a} retrying={r} paused={p}  elapsed={elapsed}s")
+                last_counts = (q, a, r, p)
+                last_print_ts = now
+
+            if (q + a + r + p) == 0 and not self.background_migrations_pending(name):
+                print("No pending background migrations")
+                return
+
+            time.sleep(poll)
+
+        raise RuntimeError("timeout: background migrations didn’t finish")
+
+    def db_migrations_up(self, name: str = "gitlab") -> bool:
+        out = self.r.run(
+            f"docker exec -t {name} bash -lc "
+            "\"gitlab-rake gitlab:check SANITIZE=true | grep -F 'All migrations up? ... yes' || true\"",
+            check=False,
+        ) or ""
+        return "All migrations up? ... yes" in out
 
     # -------------------------- version helpers ------------------------- #
 
@@ -85,7 +279,7 @@ class GitLabProbe:
             res = requests.get(
                 f"{self.base_url}/-/metadata",
                 verify=False,  # self-signed during bootstrap # noqa: S501
-                timeout=5,
+                timeout=6,
             )
             if res.status_code == HTTP_OK:
                 v = res.json().get("version")
@@ -104,7 +298,7 @@ class GitLabProbe:
             res = requests.get(
                 f"{self.base_url}/help",
                 verify=False,  # self-signed during bootstrap # noqa: S501
-                timeout=5,
+                timeout=6,
             )
             if res.status_code == HTTP_OK:
                 m = _VERSION_RE.search(html.unescape(res.text))
@@ -118,7 +312,7 @@ class GitLabProbe:
             res = requests.get(
                 f"{self.base_url}/api/v4/version",
                 verify=False,  # self-signed during bootstrap # noqa: S501
-                timeout=5,
+                timeout=6,
             )
             if res.status_code == HTTP_OK:
                 return res.json().get("version")
@@ -129,69 +323,73 @@ class GitLabProbe:
 
     # ----------------------------- wait_healthy -------------------------- #
 
-    def wait_healthy(self, expect: str, timeout: int = 1800, stable: int = 3):
-        """
-        Waits up to `timeout` seconds until the instance becomes healthy
-        and reports the expected version (prefix match).
-        Requires `stable` consecutive successful checks.
-        Prints a short status line; on timeout collects diagnostics.
-        """
-        deadline = time.monotonic() + timeout
-        ok = 0
-        backoff = 5
-        max_backoff = 15
+    def wait_healthy(
+        self,
+        expect_version: str | None,
+        timeout: int = 1800,
+        poll: int = 5,
+        throttle_s: int = 30,
+        compact: bool = True,
+    ):
+        import os
+        import time
 
-        print()
+        is_jenkins = bool(os.getenv("JENKINS_URL") or os.getenv("BUILD_ID"))
+        deadline = time.time() + timeout
 
-        while time.monotonic() < deadline:
-            http_ok = False
-            codes = []
-            docker_flag = "-"
+        name = self._find_gitlab_container()
 
-            # HTTP liveness/readiness
-            for ep in ("liveness", "health", "readiness"):
-                url = f"{self.base_url}/-/{ep}"
-                try:
-                    resp = requests.get(url, verify=False, timeout=5)  # noqa: S501
-                    code = resp.status_code
-                except requests.Timeout:
-                    code = "TIMEOUT"
-                except requests.RequestException as err:
-                    self.log.debug("HTTP %s failed: %s", url, err)
-                    code = "ERR"
+        version = "unknown"
+        try:
+            v = self.r.run(
+                f"docker exec {name} bash -lc 'cat /opt/gitlab/embedded/service/gitlab-rails/VERSION 2>/dev/null'",
+                check=False,
+            )
+            if v:
+                version = v.strip()
+        except Exception:
+            pass
 
-                codes.append(code)
-                if code == HTTP_OK:
-                    http_ok = True
-                    break
+        last_line = None
+        last_print_ts = 0.0
 
-            if not http_ok and all(c in (404, "ERR") for c in codes):
-                docker_flag = self._docker_health()
-                http_ok = docker_flag == "healthy"
+        while time.time() < deadline:
+            raw = self.r.run(
+                f"docker inspect {name} --format '{{{{json .State.Health.Status}}}}'",
+                check=False,
+                trace=False,
+            ).strip()
+            try:
+                health = json.loads(raw)
+            except Exception:
+                health = (raw or "").strip('"') or "unknown"
 
-            ver = self.version() or "?"
-            status = f"\rhttp={docker_flag if docker_flag != '-' else codes}  version={ver}  backoff={backoff:2d}s"
-            print(status, end="", flush=True)
+            line = f"http={health:<8}  version={version}"
 
-            version_ok = (ver != "?") and ver.startswith(str(expect))
-            if http_ok and version_ok:
-                ok += 1
-                if ok >= stable:
-                    print("\n      ↪ healthy, waiting 30 s for extra probes …", flush=True)
-                    time.sleep(30)
-                    return
+            now = time.time()
+            should_print = (line != last_line) or ((now - last_print_ts) >= throttle_s)
+
+            if compact and not is_jenkins:
+                if should_print:
+                    print(f"\r{line}", end="", flush=True)
+                    last_line = line
+                    last_print_ts = now
             else:
-                ok = 0
+                if should_print:
+                    print(line)
+                    last_line = line
+                    last_print_ts = now
 
-            time.sleep(backoff)
-            if backoff < max_backoff:
-                backoff = min(max_backoff, backoff + 1)
+            if health == "healthy":
+                if compact and not is_jenkins:
+                    print()
+                return
 
-        # ---------- Timeout: collect diagnostics ----------
-        print("\n❌ Timed out while waiting for GitLab to become healthy.")
-        self._diagnostics(expect)
+            time.sleep(max(1, int(poll)))
 
-        raise TimeoutError(f"GitLab never reported healthy {expect} in {timeout}s")
+        if compact and not is_jenkins:
+            print()  # finish the line nicely
+        raise RuntimeError("timeout: GitLab did not become healthy")
 
     # ------------------------------ diagnostics -------------------------- #
 
@@ -204,8 +402,10 @@ class GitLabProbe:
 
         try:
             _hdr("docker ps --format '{{.Names}} {{.Status}}' | grep gitlab")
-            out = self.r.run("docker ps --format '{{.Names}}\t{{.Status}}' | grep gitlab",
-                             check=False)
+            out = self.r.run(
+                "docker ps --format '{{.Names}}\\t{{.Status}}' | grep gitlab",
+                check=False,
+            )
             print(out or "(no running gitlab container)")
         except (RuntimeError, OSError, paramiko.SSHException) as err:
             self.log.debug("diagnostic docker ps failed: %s", err)
@@ -222,7 +422,10 @@ class GitLabProbe:
 
         try:
             _hdr("gitlab-ctl status")
-            out = self.r.run(f"docker exec -t {container} gitlab-ctl status", check=False)
+            out = self.r.run(
+                f"docker exec -t {container} gitlab-ctl status",
+                check=False,
+            )
             print(out)
         except (RuntimeError, OSError, paramiko.SSHException) as err:
             self.log.debug("diagnostic docker exec -t failed: %s", err)

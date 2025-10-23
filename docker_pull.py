@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import time
-
+import urllib.parse
 from .ssh_client import SSH
 from .utils import get_logger
 
@@ -31,6 +31,60 @@ class Puller:
         self.max_retries = int(max_retries)
         self.stall_secs = int(stall_secs)
         self.log = get_logger()
+
+    @staticmethod
+    def hub_healthy(self, remote: "SSH", repo: str = "gitlab/gitlab-ce", timeout: int = 5) -> bool:
+        """
+        Docker Hub liveness:
+          1) /v2/ should be reachable (200 or 401 are OK)
+          2) token service for repo scope should return 200
+        """
+        code1_out, _ = remote.run_with_status(
+            " ".join([
+                "curl -sS",
+                f"--connect-timeout {timeout}",
+                f"--max-time {timeout}",
+                "-o /dev/null",
+                r"-w '%{http_code}'",
+                "https://registry-1.docker.io/v2/",
+                "|| echo 000"
+            ])
+        )
+        out1 = (code1_out or "").strip()
+        ok1 = out1 in ("200", "401")
+
+        # 2) token service — awaiting 200
+        scope = urllib.parse.quote(f"repository:{repo}:pull", safe="")
+        token_url = f"https://auth.docker.io/token?service=registry.docker.io&scope={scope}"
+        code2_out, _ = remote.run_with_status(
+            " ".join([
+                "curl -sS",
+                f"--connect-timeout {timeout}",
+                f"--max-time {timeout}",
+                "-o /dev/null",
+                r"-w '%{http_code}'",
+                f"'{token_url}'",
+                "|| echo 000"
+            ])
+        )
+        out2 = (code2_out or "").strip()
+        ok2 = (out2 == "200")
+
+        if not ok1:
+            fb_out, _ = remote.run_with_status(
+                " ".join([
+                    "curl -sS",
+                    f"--connect-timeout {timeout}",
+                    f"--max-time {timeout}",
+                    "-o /dev/null",
+                    r"-w '%{http_code}'",
+                    "https://index.docker.io/v2/",
+                    "|| echo 000"
+                ])
+            )
+            ok1 = (fb_out or "").strip() in ("200", "401")
+
+        return bool(ok1 and ok2)
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -76,11 +130,12 @@ class Puller:
         return val / (1024.0 * 1024.0)
 
     # ------------------------------------------------------------------ #
-    def pull(self, remote: SSH, tag: str) -> None:
-        image = self._image_ref(remote, tag)
+    def pull(self, remote: "SSH", tag: str, edition: str = "ce") -> None:
+        image = f"gitlab/gitlab-{edition}:{tag}-{edition}.0"
 
-        if self._already_present(remote, image):
-            self.log.info(f"Image already present: {image} — skipping pull")
+        _out, rc = remote.run_with_status(f"docker image inspect {image} --format '{{{{.Id}}}}'")
+        if rc == 0:
+            self.log.info(f"image present locally: {image}")
             return
 
         backoff = 3
@@ -95,16 +150,12 @@ class Puller:
                 for ln in remote.stream(f"docker pull --progress=plain {image}"):
                     now = time.monotonic()
 
-                    # stall if no output for too long (check BEFORE refreshing the timestamp)
                     if (now - last_out_ts) > self.stall_secs:
-                        print(f"\n    ↺ no output for {self.stall_secs}s — restarting")
+                        self.log.warning(f"no output for {self.stall_secs}s — restarting")
                         remote.run(f"pkill -f 'docker pull --progress=plain {image}' || true", check=False)
                         break
 
-                    # live console line (truncated)
-                    print(f"\r    {ln[:110]:<110}", end="", flush=True)
-
-                    # we got output -> refresh timestamp
+                    self.log.debug(ln)
                     last_out_ts = now
 
                     sp = self._parse_speed_mb(ln)
@@ -112,18 +163,11 @@ class Puller:
                         last_speed = sp
                         slow = slow + 1 if sp < self.min_speed_mb else 0
                         if slow >= self.slow_streak:
-                            print(f"\n    ↺ speed < {self.min_speed_mb} MB/s for {self.slow_streak}s — restarting")
+                            self.log.warning(f"speed < {self.min_speed_mb} MB/s for {self.slow_streak}s — restarting")
                             remote.run(f"pkill -f 'docker pull --progress=plain {image}' || true", check=False)
                             break
-
-                    # stall if no output for too long
-                    if (time.time() - last_out_ts) > self.stall_secs:
-                        print(f"\n    ↺ no output for {self.stall_secs}s — restarting")
-                        remote.run(f"pkill -f 'docker pull --progress=plain {image}' || true", check=False)
-                        break
                 else:
-                    # stream finished normally -> success
-                    print()  # newline
+                    pass
                     dt = time.monotonic() - t0
                     self.log.info(f"pull completed: {image} in {dt:.1f}s (last speed~{(last_speed or 0):.2f} MB/s)")
                     return
@@ -131,7 +175,12 @@ class Puller:
             except Exception as e:
                 self.log.warning(f"stream failed: {e}")
 
-            # retry path
+            # fallback
+            _out, rc = remote.run_with_status(f"docker pull {image}")
+            if rc == 0:
+                self.log.info(f"pull completed: {image}")
+                return
+
             dt = time.monotonic() - t0
             self.log.warning(f"pull interrupted after {dt:.1f}s; retrying in {backoff}s …")
             time.sleep(backoff)
